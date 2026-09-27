@@ -347,4 +347,6 @@ final class TranslationService: ObservableObject {
         Locale.LanguageCode.isoLanguageCodes.map(\.identifier)
     }
 }
+
+extension TranslationService: APITranslationService {}
 #endif

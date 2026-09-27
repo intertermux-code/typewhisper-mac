@@ -64,7 +64,7 @@ final class ServiceContainer: ObservableObject {
     let textDiffService: TextDiffService
     let profileService: ProfileService
     let workflowService: WorkflowService
-    let translationService: AnyObject? // TranslationService (macOS 15+)
+    let translationService: (any APITranslationService)? // TranslationService (macOS 15+)
     let audioDuckingService: AudioDuckingService
     let mediaPlaybackService: MediaPlaybackService
     let dictionaryService: DictionaryService

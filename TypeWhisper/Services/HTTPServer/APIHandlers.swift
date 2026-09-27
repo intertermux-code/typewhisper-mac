@@ -3,10 +3,20 @@ import os
 
 private let apiLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "typewhisper-mac", category: "APIHandlers")
 
+/// The slice of the system translation service consumed by the local HTTP API.
+///
+/// Production passes the real `TranslationService` (macOS 15+, Translation.framework),
+/// which is MainActor-bound (it drives TranslationSession UI); the protocol mirrors
+/// that isolation. It exists so tests can substitute a fake without that framework.
+@MainActor
+protocol APITranslationService: AnyObject {
+    func translate(text: String, to target: Locale.Language, source: Locale.Language?) async throws -> String
+}
+
 final class APIHandlers: @unchecked Sendable {
     private let modelManager: ModelManagerService
     private let audioFileService: AudioFileService
-    private let translationService: AnyObject? // TranslationService (macOS 15+)
+    private let translationService: (any APITranslationService)? // TranslationService (macOS 15+)
     private let historyService: HistoryService
     private let workflowService: WorkflowService
     private let dictionaryService: DictionaryService
@@ -17,7 +27,7 @@ final class APIHandlers: @unchecked Sendable {
     init(
         modelManager: ModelManagerService,
         audioFileService: AudioFileService,
-        translationService: AnyObject?,
+        translationService: (any APITranslationService)?,
         historyService: HistoryService,
         workflowService: WorkflowService,
         dictionaryService: DictionaryService,
@@ -394,9 +404,13 @@ final class APIHandlers: @unchecked Sendable {
             )
 
             var finalText = result.text
+            var responseSegments = result.segments
+            // Reported `language` becomes the requested target once translation runs;
+            // otherwise it stays the provider-detected source language.
+            var responseLanguage = result.detectedLanguage
             if let targetCode = options.targetLanguage {
                 #if canImport(Translation)
-                if #available(macOS 15, *), let ts = translationService as? TranslationService {
+                if #available(macOS 15, *), let ts = translationService {
                     if let targetNormalized = TranslationService.normalizedLanguageIdentifier(from: targetCode) {
                         if targetCode.caseInsensitiveCompare(targetNormalized) != .orderedSame {
                             apiLogger.info("API translation target normalized \(targetCode, privacy: .public) -> \(targetNormalized, privacy: .public)")
@@ -419,6 +433,37 @@ final class APIHandlers: @unchecked Sendable {
                             to: target,
                             source: sourceLanguage
                         )
+                        // Translate segments individually so text, segments and the
+                        // reported language stay in the target language. Timing,
+                        // order, speaker attribution and segment identity carry
+                        // over untouched. Sequential on purpose: TranslationService
+                        // cancels a pending request when a new one starts, so
+                        // overlapping translations would clobber each other. A
+                        // failed segment degrades to its source text — the same
+                        // best-effort contract as the whole-text path above.
+                        // Skipped unless the caller asked for segments: the default
+                        // response shape carries none, so translating them would
+                        // burn model time for nothing.
+                        if options.responseFormat == "verbose_json" {
+                            var translatedSegments: [TranscriptionSegment] = []
+                            translatedSegments.reserveCapacity(responseSegments.count)
+                            for segment in responseSegments {
+                                let translatedText = try await ts.translate(
+                                    text: segment.text,
+                                    to: target,
+                                    source: sourceLanguage
+                                )
+                                translatedSegments.append(TranscriptionSegment(
+                                    text: translatedText,
+                                    start: segment.start,
+                                    end: segment.end,
+                                    speakerLabel: segment.speakerLabel,
+                                    speakerConfidence: segment.speakerConfidence
+                                ))
+                            }
+                            responseSegments = translatedSegments
+                        }
+                        responseLanguage = targetNormalized
                     } else {
                         apiLogger.error("API translation target language invalid: \(targetCode, privacy: .public)")
                     }
@@ -477,7 +522,7 @@ final class APIHandlers: @unchecked Sendable {
                     let segments: [SegmentEntry]
                 }
 
-                let segments = result.segments.map {
+                let segments = responseSegments.map {
                     SegmentEntry(
                         start: $0.start,
                         end: $0.end,
@@ -489,7 +534,7 @@ final class APIHandlers: @unchecked Sendable {
 
                 return .json(VerboseResponse(
                     text: finalText,
-                    language: result.detectedLanguage,
+                    language: responseLanguage,
                     duration: result.duration,
                     processing_time: result.processingTime,
                     engine: result.engineUsed,
@@ -508,7 +553,7 @@ final class APIHandlers: @unchecked Sendable {
 
                 return .json(TranscribeResponse(
                     text: finalText,
-                    language: result.detectedLanguage,
+                    language: responseLanguage,
                     duration: result.duration,
                     processing_time: result.processingTime,
                     engine: result.engineUsed,

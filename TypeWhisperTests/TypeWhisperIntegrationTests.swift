@@ -1065,6 +1065,22 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         }
     }
 
+    /// Deterministic stand-in for TranslationService: tags text with the target
+    /// language instead of really translating, and records calls so tests can
+    /// assert the whole text and each segment were translated individually.
+    @MainActor
+    private final class FakeTranslationService: APITranslationService {
+        private(set) var translatedTexts: [String] = []
+        private(set) var targets: [String] = []
+        var callCount: Int { translatedTexts.count }
+
+        func translate(text: String, to target: Locale.Language, source: Locale.Language?) async throws -> String {
+            translatedTexts.append(text)
+            targets.append(target.minimalIdentifier)
+            return "[\(target.minimalIdentifier)] \(text)"
+        }
+    }
+
     @objc(APIRouterStructuredTranscriptionPlugin)
     private final class StructuredTranscriptionPlugin: NSObject, StructuredTranscriptionEnginePlugin, @unchecked Sendable {
         static var pluginId: String { "com.typewhisper.mock.structured-transcription" }
@@ -3061,6 +3077,200 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         XCTAssertEqual(segments[0]["text"] as? String, "Hello")
         XCTAssertEqual(segments[0]["speaker"] as? String, "Speaker A")
         XCTAssertEqual(segments[1]["speaker"] as? String, "Speaker B")
+    }
+
+    /// Builds an API context whose /v1/transcribe is served by the structured
+    /// mock plugin (two speaker-labeled segments) and the fake translation
+    /// service, so target-language tests don't need the Translation framework.
+    @MainActor
+    private static func makeTargetLanguageTestContext(
+        appSupportDirectory: URL,
+        translationService: (any APITranslationService)?
+    ) -> APIContext {
+        let context = Self.makeAPIContext(
+            appSupportDirectory: appSupportDirectory,
+            translationService: translationService
+        )
+        let plugin = StructuredTranscriptionPlugin()
+        PluginManager.shared.loadedPlugins.append(
+            LoadedPlugin(
+                manifest: PluginManifest(
+                    id: "com.typewhisper.mock.structured-transcription",
+                    name: "Structured Mock Transcription",
+                    version: "1.0.0",
+                    principalClass: "APIRouterStructuredTranscriptionPlugin"
+                ),
+                instance: plugin,
+                bundle: Bundle.main,
+                sourceURL: appSupportDirectory,
+                isEnabled: true
+            )
+        )
+        context.modelManager.selectProvider(plugin.providerId)
+        return context
+    }
+
+    @MainActor
+    func testTranscribeTargetLanguageTranslatesSegmentsAndReportsTargetLanguage() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        let fakeTranslationService = FakeTranslationService()
+        context = Self.makeTargetLanguageTestContext(
+            appSupportDirectory: appSupportDirectory,
+            translationService: fakeTranslationService
+        )
+        let router = try XCTUnwrap(context?.router)
+
+        let wavData = WavEncoder.encode(Array(repeating: Float(0), count: 1600))
+        let response = try Self.jsonObject(await router.route(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/transcribe",
+                queryParams: [:],
+                headers: [
+                    "content-type": "audio/wav",
+                    "x-response-format": "verbose_json",
+                    "x-target-language": "de",
+                ],
+                body: wavData
+            )
+        ))
+
+        // Whole text translated; reported language is the requested target,
+        // not the provider-detected source language (#1299).
+        XCTAssertEqual(response["text"] as? String, "[de] Speaker A: Hello\nSpeaker B: Hi")
+        XCTAssertEqual(response["language"] as? String, "de")
+
+        // Every segment translated in place: same count, order, timing and
+        // speaker attribution, only the text changed.
+        let segments = try XCTUnwrap(response["segments"] as? [[String: Any]])
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertEqual(segments[0]["text"] as? String, "[de] Hello")
+        XCTAssertEqual(segments[0]["start"] as? Double, 0.0)
+        XCTAssertEqual(segments[0]["end"] as? Double, 1.0)
+        XCTAssertEqual(segments[0]["speaker"] as? String, "Speaker A")
+        XCTAssertEqual(segments[0]["speaker_confidence"] as? Double, 0.9)
+        XCTAssertEqual(segments[1]["text"] as? String, "[de] Hi")
+        XCTAssertEqual(segments[1]["start"] as? Double, 1.0)
+        XCTAssertEqual(segments[1]["end"] as? Double, 2.0)
+        XCTAssertEqual(segments[1]["speaker"] as? String, "Speaker B")
+
+        // Whole text plus one translation call per segment.
+        XCTAssertEqual(fakeTranslationService.callCount, 3)
+        XCTAssertEqual(fakeTranslationService.translatedTexts.first, "Speaker A: Hello\nSpeaker B: Hi")
+        XCTAssertEqual(Set(fakeTranslationService.targets), ["de"])
+    }
+
+    @MainActor
+    func testTranscribeTargetLanguageDefaultFormatReportsTargetLanguage() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        let fakeTranslationService = FakeTranslationService()
+        context = Self.makeTargetLanguageTestContext(
+            appSupportDirectory: appSupportDirectory,
+            translationService: fakeTranslationService
+        )
+        let router = try XCTUnwrap(context?.router)
+
+        let wavData = WavEncoder.encode(Array(repeating: Float(0), count: 1600))
+        let response = try Self.jsonObject(await router.route(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/transcribe",
+                queryParams: [:],
+                headers: [
+                    "content-type": "audio/wav",
+                    "x-target-language": "de",
+                ],
+                body: wavData
+            )
+        ))
+
+        XCTAssertEqual(response["text"] as? String, "[de] Speaker A: Hello\nSpeaker B: Hi")
+        XCTAssertEqual(response["language"] as? String, "de")
+        XCTAssertNil(response["segments"])
+        // The default shape carries no segments, so only the whole text is translated.
+        XCTAssertEqual(fakeTranslationService.callCount, 1)
+    }
+
+    @MainActor
+    func testTranscribeWithoutTargetLanguageKeepsSourceSegmentsAndLanguage() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        let fakeTranslationService = FakeTranslationService()
+        context = Self.makeTargetLanguageTestContext(
+            appSupportDirectory: appSupportDirectory,
+            translationService: fakeTranslationService
+        )
+        let router = try XCTUnwrap(context?.router)
+
+        let wavData = WavEncoder.encode(Array(repeating: Float(0), count: 1600))
+        let response = try Self.jsonObject(await router.route(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/transcribe",
+                queryParams: [:],
+                headers: [
+                    "content-type": "audio/wav",
+                    "x-response-format": "verbose_json",
+                ],
+                body: wavData
+            )
+        ))
+
+        XCTAssertEqual(response["text"] as? String, "Speaker A: Hello\nSpeaker B: Hi")
+        let segments = try XCTUnwrap(response["segments"] as? [[String: Any]])
+        XCTAssertEqual(segments[0]["text"] as? String, "Hello")
+        XCTAssertEqual(segments[1]["text"] as? String, "Hi")
+        XCTAssertEqual(fakeTranslationService.callCount, 0)
+    }
+
+    @MainActor
+    func testTranscribeTargetLanguageWithoutTranslationServiceReturns501() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        MockTranscriptionPlugin.reset()
+        context = Self.makeAPIContext(
+            appSupportDirectory: appSupportDirectory,
+            withMockTranscriptionPlugin: true
+        )
+        let router = try XCTUnwrap(context?.router)
+
+        let wavData = WavEncoder.encode(Array(repeating: Float(0), count: 1600))
+        let response = await router.route(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/transcribe",
+                queryParams: [:],
+                headers: [
+                    "content-type": "audio/wav",
+                    "x-target-language": "de",
+                ],
+                body: wavData
+            )
+        )
+
+        XCTAssertEqual(response.status, 501)
     }
 
     func testTranscribeLocalFileEndpointTranscribesTemporaryWavFile() async throws {
@@ -11428,6 +11638,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
     private static func makeAPIContext(
         appSupportDirectory: URL,
         withMockTranscriptionPlugin: Bool = false,
+        translationService: (any APITranslationService)? = nil,
         audioDeviceTransportResolver: AudioDeviceTransportResolving = CoreAudioDeviceTransportResolver(),
         audioDeviceBluetoothInputRouteStabilizer: BluetoothInputRouteStabilizing = CoreAudioBluetoothInputRouteStabilizer(),
         audioDeviceSelectionEngineValidator: AudioInputSelectionEngineValidating = AVAudioInputSelectionEngineValidator(),
@@ -11583,7 +11794,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         let handlers = APIHandlers(
             modelManager: modelManager,
             audioFileService: audioFileService,
-            translationService: nil,
+            translationService: translationService,
             historyService: historyService,
             workflowService: workflowService,
             dictionaryService: dictionaryService,
